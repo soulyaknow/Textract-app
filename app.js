@@ -53,7 +53,6 @@ const sendToN8N = async (data) => {
   try {
     console.log("Sending data:", data);
     const response = await axios.post(n8nWebhookUrl, data);
-    console.log(response);
     console.log("Data sent to n8n successfully:", response.data);
   } catch (error) {
     console.error("Error sending data to n8n:", {
@@ -110,7 +109,9 @@ app.post("/upload", upload.single("file"), async (req, res) => {
     // Send the Textract results to n8n
     await sendToN8N(textractResults);
 
-    res.status(200).send("File processed successfully.");
+    res
+      .status(200)
+      .send({ message: "File processed successfully.", data: textractResults });
   } catch (error) {
     console.error("Error processing file:", error);
     res.status(500).send("Error processing file.");
