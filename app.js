@@ -394,6 +394,40 @@ const getPayslipTextractResults = async (jobId) => {
   });
 };
 
+const getEmploymentContractTextractResults = async (jobId) => {
+  return new Promise((resolve, reject) => {
+    const interval = setInterval(async () => {
+      try {
+        // Check the job status
+        const jobResponse = await textract
+          .getDocumentAnalysis({ JobId: jobId })
+          .promise();
+
+        // If job succeeded, retrieve only the first page
+        if (jobResponse.JobStatus === "SUCCEEDED") {
+          clearInterval(interval);
+
+          // Fetch the first page of results
+          const pageResponse = await textract
+            .getDocumentAnalysis({
+              JobId: jobId,
+            })
+            .promise();
+
+          // Resolve with only the first page blocks
+          resolve(pageResponse.Blocks);
+        } else if (jobResponse.JobStatus === "FAILED") {
+          clearInterval(interval);
+          reject("Textract job failed.");
+        }
+      } catch (error) {
+        clearInterval(interval);
+        reject(error);
+      }
+    }, 5000); // Poll every 5 seconds
+  });
+};
+
 // Function to send results to n8n webhook
 const sendToN8N = async (data) => {
   try {
@@ -637,6 +671,59 @@ const simplifyPayslipTextractResults = (textractData) => {
     .filter((entry) => entry !== null); // Remove any null entries
 };
 
+const simplifyEmploymentContractTextractResults = (textractData) => {
+  if (!textractData || !Array.isArray(textractData)) {
+    console.error("Textract data is undefined or not an array");
+    return [];
+  }
+
+  // Ensure textractData contains valid blocks with a BlockType
+  const blocks = textractData.filter((block) => block && block.BlockType);
+  if (!blocks.length) {
+    console.error("No blocks found in textract data");
+    return [];
+  }
+
+  // Regular expression to match email addresses
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  const labeledEmailRegex = /Email:\s*([^\s@]+@[^\s@]+\.[^\s@]+)/i;
+
+  // Process the blocks and return the simplified results
+  return blocks
+    .map((block) => {
+      if (block.BlockType === "LINE") {
+        const text = block.Text || "";
+
+        // Check if the line contains an email labeled as "Email:"
+        const labeledEmailMatch = text.match(labeledEmailRegex);
+        if (labeledEmailMatch) {
+          return { email: labeledEmailMatch[1].trim() };
+        }
+
+        // Check if the line contains a standalone email
+        if (emailRegex.test(text)) {
+          return { email: text.trim() };
+        }
+
+        // If it's a normal line, keep it as-is
+        return { text, type: "LINE" };
+      } else if (block.BlockType === "KEY_VALUE_SET") {
+        const isKey = block.EntityTypes && block.EntityTypes.includes("KEY");
+        const isValue =
+          block.EntityTypes && block.EntityTypes.includes("VALUE");
+        const keyText = isKey ? block.Text || "Unknown Key" : undefined;
+        const valueText = isValue ? block.Text || "Unknown Value" : undefined;
+
+        return keyText && valueText
+          ? { text: `${keyText} : ${valueText}`, type: "KEY_VALUE_PAIR" }
+          : null;
+      }
+      return null;
+    })
+    .filter((entry) => entry !== null) // Remove any null entries
+    .slice(0, 50); // Get only the first 20 entries
+};
+
 // const simplifyTextractResults = (textractData) => {
 //   if (!textractData || !Array.isArray(textractData)) {
 //     console.error("Textract data is undefined or not an array");
@@ -745,7 +832,6 @@ app.post("/upload", upload.single("file"), async (req, res) => {
             simplifyFactFindTextractResults(textractResults);
 
           console.log(simplifiedResults);
-
           // Send the Textract results to n8n
           // await sendToN8N(simplifiedResults);
 
@@ -762,8 +848,9 @@ app.post("/upload", upload.single("file"), async (req, res) => {
           const textractResults = await getClientHandoverTextractResults(jobId);
           const simplifiedResults = simplifyTextractResults(textractResults);
 
+          console.log(simplifiedResults);
           // Send the Textract results to n8n
-          await sendToN8N(simplifiedResults);
+          // await sendToN8N(simplifiedResults);
 
           res.status(200).send({
             message: "File processed successfully for client_handover.",
@@ -796,8 +883,10 @@ app.post("/upload", upload.single("file"), async (req, res) => {
           console.log("Extracting passport_file");
           const textractResults = await getPassportFileTextractResults(jobId);
           const simplifiedResults = simplifyTextractResults(textractResults);
+
+          console.log(simplifiedResults);
           // Send the Textract results to n8n
-          await sendToN8N(simplifiedResults);
+          // await sendToN8N(simplifiedResults);
 
           res.status(200).send({
             message: "File processed successfully for passport_file.",
@@ -812,8 +901,9 @@ app.post("/upload", upload.single("file"), async (req, res) => {
           const textractResults = await getNationalIDTextractResults(jobId);
           const simplifiedResults = simplifyTextractResults(textractResults);
 
+          console.log(simplifiedResults);
           // Send the Textract results to n8n
-          await sendToN8N(simplifiedResults);
+          // await sendToN8N(simplifiedResults);
 
           res.status(200).send({
             message: "File processed successfully for national_id_file.",
@@ -830,8 +920,9 @@ app.post("/upload", upload.single("file"), async (req, res) => {
           );
           const simplifiedResults = simplifyTextractResults(textractResults);
 
+          console.log(simplifiedResults);
           // Send the Textract results to n8n
-          await sendToN8N(simplifiedResults);
+          // await sendToN8N(simplifiedResults);
 
           res.status(200).send({
             message: "File processed successfully for birth_cert_file.",
@@ -846,8 +937,9 @@ app.post("/upload", upload.single("file"), async (req, res) => {
           const textractResults = await getMedicareTextractResults(jobId);
           const simplifiedResults = simplifyTextractResults(textractResults);
 
+          console.log(simplifiedResults);
           // Send the Textract results to n8n
-          await sendToN8N(simplifiedResults);
+          // await sendToN8N(simplifiedResults);
 
           res.status(200).send({
             message: "File processed successfully for medicare_file.",
@@ -869,6 +961,27 @@ app.post("/upload", upload.single("file"), async (req, res) => {
 
           res.status(200).send({
             message: "File processed successfully for payslip_file.",
+            data: simplifiedResults,
+          });
+        }
+        break;
+
+      case "employment_contract_file":
+        {
+          console.log("Extracting employment_contract_file");
+          const textractResults = await getEmploymentContractTextractResults(
+            jobId
+          );
+          const simplifiedResults =
+            simplifyEmploymentContractTextractResults(textractResults);
+
+          console.log(simplifiedResults);
+          // Send the Textract results to n8n
+          // await sendToN8N(simplifiedResults);
+
+          res.status(200).send({
+            message:
+              "File processed successfully for employment_contract_file.",
             data: simplifiedResults,
           });
         }
