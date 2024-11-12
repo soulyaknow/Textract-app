@@ -348,6 +348,52 @@ const getMedicareTextractResults = async (jobId) => {
   });
 };
 
+const getPayslipTextractResults = async (jobId) => {
+  return new Promise((resolve, reject) => {
+    const interval = setInterval(async () => {
+      try {
+        // Check the job status
+        const jobResponse = await textract
+          .getDocumentAnalysis({ JobId: jobId })
+          .promise();
+
+        // If job succeeded, retrieve all pages
+        if (jobResponse.JobStatus === "SUCCEEDED") {
+          clearInterval(interval);
+
+          // Initialize array to store all blocks and pagination token
+          let allBlocks = [];
+          let nextToken = null;
+
+          do {
+            // Fetch results page by page using nextToken
+            const pageResponse = await textract
+              .getDocumentAnalysis({
+                JobId: jobId,
+                NextToken: nextToken,
+              })
+              .promise();
+
+            // Append blocks from each page to the result
+            allBlocks.push(...pageResponse.Blocks);
+
+            // Update nextToken for next page, or set to null if no more pages
+            nextToken = pageResponse.NextToken || null;
+          } while (nextToken);
+
+          resolve(allBlocks);
+        } else if (jobResponse.JobStatus === "FAILED") {
+          clearInterval(interval);
+          reject("Textract job failed.");
+        }
+      } catch (error) {
+        clearInterval(interval);
+        reject(error);
+      }
+    }, 5000); // Poll every 5 seconds
+  });
+};
+
 // Function to send results to n8n webhook
 const sendToN8N = async (data) => {
   try {
@@ -402,7 +448,7 @@ const sendToN8N = async (data) => {
 //     .filter((entry) => entry !== null); // Remove any null entries
 // };
 
-const simplifyTextractResults = (textractData) => {
+const simplifyFactFindTextractResults = (textractData) => {
   if (!textractData || !Array.isArray(textractData)) {
     console.error("Textract data is undefined or not an array");
     return [];
@@ -415,6 +461,8 @@ const simplifyTextractResults = (textractData) => {
   }
 
   let applicantsFound = false;
+  let employmentSectionFound = false;
+  let currentEmployerCount = 0;
 
   return blocks
     .slice(8)
@@ -429,6 +477,31 @@ const simplifyTextractResults = (textractData) => {
       } else if (text.includes("CO-APPLICANT")) {
         applicantsFound = true;
         return { text: "CO-APPLICANT / SECONDARY APPLICANT", type: "LINE" };
+      }
+
+      // Detect start of the "CURRENT EMPLOYMENT/INCOME" section
+      if (text === "CURRENT EMPLOYMENT/INCOME") {
+        employmentSectionFound = true;
+        return { text: "CURRENT EMPLOYMENT/INCOME", type: "LINE" };
+      }
+
+      // Check for "Current Employer" entries within the employment section
+      if (
+        employmentSectionFound &&
+        typeof text === "object" &&
+        text["Current Employer"]
+      ) {
+        currentEmployerCount += 1;
+
+        // If there are more than 3 employers, return a cancel message
+        if (currentEmployerCount > 3) {
+          return {
+            text: "Cancel: Too many current employers",
+            type: "MESSAGE",
+          };
+        }
+
+        return { text: text, type: "LINE" };
       }
 
       // Format name details
@@ -458,6 +531,172 @@ const simplifyTextractResults = (textractData) => {
     })
     .filter((entry) => entry !== null);
 };
+
+const simplifyDriverLicenceTextractResults = (textractData) => {
+  if (!textractData || !Array.isArray(textractData)) {
+    console.error("Textract data is undefined or not an array");
+    return [];
+  }
+
+  // Ensure textractData contains valid blocks with a BlockType
+  const blocks = textractData.filter((block) => block && block.BlockType);
+  if (!blocks.length) {
+    console.error("No blocks found in textract data");
+    return [];
+  }
+
+  const nonNameKeywords = [
+    "Driver",
+    "Licence",
+    "Card",
+    "Number",
+    "Class",
+    "Date",
+    "of",
+    "Birth",
+    "Expiry",
+  ];
+
+  // Process the blocks and return the simplified results
+  return blocks
+    .map((block) => {
+      if (block.BlockType === "LINE") {
+        const text = block.Text || "";
+        const words = text.split(" ");
+
+        // Check if the line looks like a name: capitalized words, max 3 parts, no keywords
+        const isPossibleName =
+          words.length <= 3 &&
+          words.every((word) => /^[A-Z][a-zA-Z]*$/.test(word)) &&
+          !words.some((word) => nonNameKeywords.includes(word));
+
+        if (isPossibleName) {
+          const [firstName, middleName, surname] = words;
+          let nameObject = { firstName };
+          if (surname) {
+            nameObject.surname = surname;
+          }
+          if (middleName && surname) {
+            nameObject.middleName = middleName;
+          }
+          return { text: nameObject, type: "FULL_NAME" };
+        }
+
+        return { text: text, type: "LINE" };
+      }
+
+      // Handle KEY_VALUE_SET blocks
+      if (block.BlockType === "KEY_VALUE_SET") {
+        const isKey = block.EntityTypes && block.EntityTypes.includes("KEY");
+        const isValue =
+          block.EntityTypes && block.EntityTypes.includes("VALUE");
+        const keyText = isKey ? block.Text || "Unknown Key" : undefined;
+        const valueText = isValue ? block.Text || "Unknown Value" : undefined;
+
+        return keyText && valueText
+          ? { text: `${keyText} : ${valueText}`, type: "KEY_VALUE_PAIR" }
+          : null;
+      }
+
+      return null;
+    })
+    .filter((entry) => entry !== null); // Remove any null entries
+};
+
+const simplifyPayslipTextractResults = (textractData) => {
+  if (!textractData || !Array.isArray(textractData)) {
+    console.error("Textract data is undefined or not an array");
+    return [];
+  }
+
+  // Ensure textractData contains valid blocks with a BlockType
+  const blocks = textractData.filter((block) => block && block.BlockType);
+  if (!blocks.length) {
+    console.error("No blocks found in textract data");
+    return [];
+  }
+
+  // Process the blocks and return the simplified results
+  return blocks
+    .map((block) => {
+      if (block.BlockType === "LINE") {
+        return { text: block.Text || "", type: "LINE" };
+      } else if (block.BlockType === "KEY_VALUE_SET") {
+        const isKey = block.EntityTypes && block.EntityTypes.includes("KEY");
+        const isValue =
+          block.EntityTypes && block.EntityTypes.includes("VALUE");
+        const keyText = isKey ? block.Text || "Unknown Key" : undefined;
+        const valueText = isValue ? block.Text || "Unknown Value" : undefined;
+
+        return keyText && valueText
+          ? { text: `${keyText} : ${valueText}`, type: "KEY_VALUE_PAIR" }
+          : null;
+      }
+      return null;
+    })
+    .filter((entry) => entry !== null); // Remove any null entries
+};
+
+// const simplifyTextractResults = (textractData) => {
+//   if (!textractData || !Array.isArray(textractData)) {
+//     console.error("Textract data is undefined or not an array");
+//     return [];
+//   }
+
+//   const blocks = textractData.filter((block) => block && block.BlockType);
+//   if (!blocks.length) {
+//     console.error("No blocks found in textract data");
+//     return [];
+//   }
+
+//   let applicantsFound = false;
+//   let currentEmployers = [];
+//   let employerLimitReached = false;
+
+//   return blocks
+//     .slice(8)
+//     .map((block) => {
+//       const text = block.Text || "";
+
+//       // Detect "CURRENT EMPLOYMENT/INCOME" and reset employer list
+//       if (text.includes("CURRENT EMPLOYMENT/INCOME")) {
+//         applicantsFound = true;
+//         currentEmployers = []; // Reset for new applicant
+//         return { text: "CURRENT EMPLOYMENT/INCOME", type: "LINE" };
+//       }
+
+//       // Group "Current Employer" data
+//       if (applicantsFound && text.includes("Current Employer")) {
+//         if (currentEmployers.length < 3) {
+//           currentEmployers.push(text.replace("Current Employer: ", "").trim());
+//           return null; // Skip returning individual employer entries
+//         } else {
+//           employerLimitReached = true;
+//         }
+//       }
+
+//       // At the end of current employer data, check and return grouped employers
+//       if (employerLimitReached || text.includes("PRIMARY APPLICANT") || text.includes("CO-APPLICANT")) {
+//         employerLimitReached = false; // Reset limit flag for next section
+//         if (currentEmployers.length > 0) {
+//           const groupedEmployers = {
+//             text: { "Current Employers": currentEmployers },
+//             type: "LINE",
+//           };
+//           currentEmployers = []; // Clear for next applicant group
+//           return groupedEmployers;
+//         }
+
+//         if (currentEmployers.length > 3) {
+//           return { text: "Cancel: Too many current employers", type: "MESSAGE" };
+//         }
+//       }
+
+//       // Default LINE type for any other text without key-value
+//       return { text: text, type: "LINE" };
+//     })
+//     .filter((entry) => entry !== null);
+// };
 
 // POST endpoint to accept a file
 app.post("/upload", upload.single("file"), async (req, res) => {
@@ -502,10 +741,13 @@ app.post("/upload", upload.single("file"), async (req, res) => {
         {
           console.log("Extracting find_fact_file");
           const textractResults = await getFactFindTextractResults(jobId);
-          const simplifiedResults = simplifyTextractResults(textractResults);
+          const simplifiedResults =
+            simplifyFactFindTextractResults(textractResults);
+
+          console.log(simplifiedResults);
 
           // Send the Textract results to n8n
-          await sendToN8N(simplifiedResults);
+          // await sendToN8N(simplifiedResults);
 
           res.status(200).send({
             message: "File processed successfully for find_fact_file.",
@@ -534,10 +776,13 @@ app.post("/upload", upload.single("file"), async (req, res) => {
         {
           console.log("Extracting driver_license_file");
           const textractResults = await getDriverLicenseTextractResults(jobId);
-          const simplifiedResults = simplifyTextractResults(textractResults);
+          const simplifiedResults =
+            simplifyDriverLicenceTextractResults(textractResults);
+
+          console.log(simplifiedResults);
 
           // Send the Textract results to n8n
-          await sendToN8N(simplifiedResults);
+          // await sendToN8N(simplifiedResults);
 
           res.status(200).send({
             message: "File processed successfully for driver_license_file.",
@@ -606,6 +851,24 @@ app.post("/upload", upload.single("file"), async (req, res) => {
 
           res.status(200).send({
             message: "File processed successfully for medicare_file.",
+            data: simplifiedResults,
+          });
+        }
+        break;
+
+      case "payslip_file":
+        {
+          console.log("Extracting payslip_file");
+          const textractResults = await getPayslipTextractResults(jobId);
+          const simplifiedResults =
+            simplifyPayslipTextractResults(textractResults);
+
+          console.log(simplifiedResults);
+          // Send the Textract results to n8n
+          // await sendToN8N(simplifiedResults);
+
+          res.status(200).send({
+            message: "File processed successfully for payslip_file.",
             data: simplifiedResults,
           });
         }
